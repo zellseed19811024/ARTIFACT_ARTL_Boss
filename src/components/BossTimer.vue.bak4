@@ -1,0 +1,1885 @@
+<script setup>
+import { ref, computed, onMounted, onUnmounted } from "vue";
+
+// 導入 BOSS 配置
+import {
+  bossConfig,
+  getLootsByBossId,
+  getAllLoots,
+} from "@/config/bossConfig.js";
+
+// 導入 Heroicons
+import {
+  TrashIcon,
+  PlusCircleIcon,
+  PlusIcon,
+  XMarkIcon,
+  MagnifyingGlassIcon,
+  ClockIcon,
+  MapPinIcon,
+  SparklesIcon,
+  ShareIcon,
+  DocumentTextIcon,
+  CheckBadgeIcon,
+  FireIcon,
+  BoltIcon,
+  EyeIcon,
+} from "@heroicons/vue/24/outline";
+
+import { StarIcon as StarSolidIcon } from "@heroicons/vue/24/solid";
+
+// ===== 清除記錄(本地端所有記錄) =====
+
+const clearRecordsLocal = () => {
+  if (confirm("確定要清除所有記錄嗎？")) {
+    localStorage.removeItem("killRecords");
+    killRecords.value = [];
+  }
+};
+
+// ===== 擊殺記錄列表 =====
+const killRecords = ref([]);
+
+// 排序後的記錄列表（按最早重生時間排序）
+const sortedKillRecords = computed(() => {
+  return [...killRecords.value].sort((a, b) => {
+    const timeA = new Date(a.respawnTimeMin).getTime();
+    const timeB = new Date(b.respawnTimeMin).getTime();
+    return timeA - timeB; // 由早到晚排序
+  });
+});
+
+// 按狀態分組的記錄
+const groupedRecords = computed(() => {
+  const respawned = []; // 已重生
+  const respawning = []; // 可能已重生
+  const waiting = []; // 即將重生
+
+  sortedKillRecords.value.forEach((record) => {
+    const status = getRecordCountdown(record).status;
+    if (status === "respawned") {
+      respawned.push(record);
+    } else if (status === "respawning") {
+      respawning.push(record);
+    } else if (status === "waiting") {
+      waiting.push(record);
+    }
+  });
+
+  return { respawned, respawning, waiting };
+});
+
+// 各群組排序：時間（最早重生先）或頻道（數字順序，同頻道再依重生時間）
+const groupSortMode = ref({
+  respawned: "time",
+  respawning: "time",
+  waiting: "time",
+});
+
+// 「已重生」區塊預設收合，可手動展開
+const showRespawnedSection = ref(false);
+
+const sortGroupRecords = (records, sortBy) => {
+  const list = [...records];
+  if (sortBy === "channel") {
+    list.sort((a, b) => {
+      const c = String(a.channel).localeCompare(String(b.channel), "zh-Hant", {
+        numeric: true,
+        sensitivity: "base",
+      });
+      if (c !== 0) return c;
+      return (
+        new Date(a.respawnTimeMin).getTime() -
+        new Date(b.respawnTimeMin).getTime()
+      );
+    });
+  } else {
+    list.sort((a, b) => {
+      const t =
+        new Date(a.respawnTimeMin).getTime() -
+        new Date(b.respawnTimeMin).getTime();
+      if (t !== 0) return t;
+      return String(a.channel).localeCompare(String(b.channel), "zh-Hant", {
+        numeric: true,
+        sensitivity: "base",
+      });
+    });
+  }
+  return list;
+};
+
+const sortedGroupedRecords = computed(() => ({
+  respawned: sortGroupRecords(
+    groupedRecords.value.respawned,
+    groupSortMode.value.respawned
+  ),
+  respawning: sortGroupRecords(
+    groupedRecords.value.respawning,
+    groupSortMode.value.respawning
+  ),
+  waiting: sortGroupRecords(
+    groupedRecords.value.waiting,
+    groupSortMode.value.waiting
+  ),
+}));
+
+// 頻道排序時：與上一筆或下一筆頻道號差距 ≤ N 則列背景霓虹綠（N 可於頁尾調整）
+const channelProximityN = ref(5);
+
+const parseChannelNumber = (ch) => {
+  const n = parseInt(String(ch ?? "").trim(), 10);
+  return Number.isFinite(n) ? n : null;
+};
+
+const showChannelProximityRowBg = (groupKey, index) => {
+  if (groupSortMode.value[groupKey] !== "channel") return false;
+  const n = Math.max(0, Number(channelProximityN.value) || 0);
+  const records = sortedGroupedRecords.value[groupKey];
+  if (!records?.length || index < 0 || index >= records.length) return false;
+  const cur = parseChannelNumber(records[index].channel);
+  if (cur === null) return false;
+  if (index > 0) {
+    const prev = parseChannelNumber(records[index - 1].channel);
+    if (prev !== null && Math.abs(cur - prev) <= n) return true;
+  }
+  if (index < records.length - 1) {
+    const next = parseChannelNumber(records[index + 1].channel);
+    if (next !== null && Math.abs(cur - next) <= n) return true;
+  }
+  return false;
+};
+
+// 新增一筆紀錄的彈窗
+const isAddRecordModalOpen = ref(false);
+const addRecordForm = ref({
+  boss: "",
+  channel: "",
+  killTime: "",
+  killLocation: "",
+  loot: "",
+});
+
+// 頻道輸入框的 ref
+const channelInputRef = ref(null);
+
+// 自定義下拉選單狀態
+const isDropdownOpen = ref(false);
+const dropdownSearch = ref("");
+
+// ===== BOSS 最愛（收藏後置頂）=====
+const favoriteBossStorageKey = "favoriteBossIds";
+const favoriteBossIds = ref([]);
+const favoriteBossIdSet = computed(() => new Set(favoriteBossIds.value));
+
+const loadFavoriteBossIds = () => {
+  try {
+    const raw = localStorage.getItem(favoriteBossStorageKey);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      favoriteBossIds.value = parsed.filter(
+        (id) => typeof id === "string" && id.length > 0
+      );
+    }
+  } catch (_) {
+    // ignore
+  }
+};
+
+const saveFavoriteBossIds = () => {
+  localStorage.setItem(
+    favoriteBossStorageKey,
+    JSON.stringify(favoriteBossIds.value)
+  );
+};
+
+const toggleFavoriteBoss = (bossId) => {
+  if (!bossId) return;
+  const list = [...favoriteBossIds.value];
+  const idx = list.indexOf(bossId);
+  if (idx >= 0) {
+    list.splice(idx, 1);
+  } else {
+    // 新增到最前面（最愛置頂）
+    list.unshift(bossId);
+  }
+  favoriteBossIds.value = list;
+  saveFavoriteBossIds();
+};
+
+const isBossFavorite = (bossId) => favoriteBossIdSet.value.has(bossId);
+
+// 擊殺時間的「時」「分」拆開給 24 小時制輸入用
+const killTimeHour = computed(() => {
+  const t = addRecordForm.value.killTime;
+  if (!t || !t.includes(":")) return "";
+  return t.split(":")[0] || "";
+});
+const killTimeMinute = computed(() => {
+  const t = addRecordForm.value.killTime;
+  if (!t || !t.includes(":")) return "";
+  return t.split(":")[1] || "";
+});
+const onKillTimeHourInput = (e) => {
+  const v = e.target.value;
+  const m = (addRecordForm.value.killTime && addRecordForm.value.killTime.split(":")[1]) || "00";
+  if (v === "") {
+    addRecordForm.value.killTime = `00:${m}`;
+    return;
+  }
+  const n = parseInt(v, 10);
+  if (!Number.isNaN(n)) {
+    const h = String(Math.min(23, Math.max(0, n))).padStart(2, "0");
+    addRecordForm.value.killTime = `${h}:${m}`;
+  }
+};
+const onKillTimeMinuteInput = (e) => {
+  const v = e.target.value;
+  const h = (addRecordForm.value.killTime && addRecordForm.value.killTime.split(":")[0]) || "00";
+  if (v === "") {
+    addRecordForm.value.killTime = `${h}:00`;
+    return;
+  }
+  const n = parseInt(v, 10);
+  if (!Number.isNaN(n)) {
+    const m = String(Math.min(59, Math.max(0, n))).padStart(2, "0");
+    addRecordForm.value.killTime = `${h}:${m}`;
+  }
+};
+
+// 根據選擇的 BOSS 判斷是否需要顯示地點欄位
+const selectedBossConfig = computed(() => {
+  if (!addRecordForm.value.boss) return null;
+  return bossConfig.find((b) => b.id === addRecordForm.value.boss);
+});
+
+// 過濾後的 BOSS 列表（根據搜尋）
+const filteredBosses = computed(() => {
+  const base = !dropdownSearch.value
+    ? bossConfig
+    : bossConfig.filter((boss) => {
+        const search = dropdownSearch.value.toLowerCase();
+        return (
+          boss.name.toLowerCase().includes(search) ||
+          boss.description.toLowerCase().includes(search)
+        );
+      });
+
+  // 收藏置頂：依 favoriteBossIds 的順序排在最前面
+  const favorites = base.filter((boss) => favoriteBossIdSet.value.has(boss.id));
+  favorites.sort(
+    (a, b) =>
+      favoriteBossIds.value.indexOf(a.id) - favoriteBossIds.value.indexOf(b.id)
+  );
+  const nonFavorites = base.filter(
+    (boss) => !favoriteBossIdSet.value.has(boss.id)
+  );
+  return [...favorites, ...nonFavorites];
+});
+
+// 選擇 BOSS
+const selectBoss = (bossId) => {
+  addRecordForm.value.boss = bossId;
+  isDropdownOpen.value = false;
+  dropdownSearch.value = "";
+};
+
+// 取得 BOSS 圖片 URL
+const getBossImage = (bossId) => {
+  try {
+    return new URL(`../assets/images/${bossId}.png`, import.meta.url).href;
+  } catch (e) {
+    console.error(`無法載入圖片: ${bossId}.png`, e);
+    return ""; // 返回空字串，讓圖片載入失敗時不顯示
+  }
+};
+
+const openAddRecordModal = () => {
+  console.log("openAddRecordModal called, current boss:", addRecordForm.value.boss);
+  
+  if (!addRecordForm.value.boss) {
+    alert("請先選擇一個 BOSS");
+    return;
+  }
+
+  isAddRecordModalOpen.value = true;
+  // 获取当前时间并格式化为 HH:mm 格式（input type="time" 需要的格式）
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const timeString = `${hours}:${minutes}`;
+
+  // 保留已选择的 boss，只更新其他字段
+  const currentBoss = addRecordForm.value.boss;
+  addRecordForm.value = {
+    boss: currentBoss, // 保留已选择的 boss
+    channel: "",
+    killTime: timeString,
+    killLocation: "",
+    loot: "",
+  };
+
+  console.log("After setting, boss is:", addRecordForm.value.boss);
+
+  // 等待 DOM 更新後，自動 focus 到頻道輸入框
+  setTimeout(() => {
+    if (channelInputRef.value) {
+      channelInputRef.value.focus();
+    }
+  }, 100);
+};
+
+const closeAddRecordModal = () => {
+  isAddRecordModalOpen.value = false;
+};
+
+const addRecord = () => {
+  if (
+    !addRecordForm.value.boss ||
+    !addRecordForm.value.channel ||
+    !addRecordForm.value.killTime
+  ) {
+    alert("請填寫必填欄位");
+    return;
+  }
+
+  const bossInfo = bossConfig.find((b) => b.id === addRecordForm.value.boss);
+
+  // 將時間字串轉換為完整的日期時間（格式須為 HH:mm，與擊殺時間 24 小時制輸入一致）
+  const timeParts = addRecordForm.value.killTime.split(":");
+  const hours = parseInt(timeParts[0], 10);
+  const minutes = parseInt(timeParts[1], 10);
+  if (timeParts.length !== 2 || Number.isNaN(hours) || Number.isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    alert("擊殺時間格式不正確，請使用 24 小時制（時:分）");
+    return;
+  }
+  const killDateTime = new Date();
+  killDateTime.setHours(hours, minutes, 0, 0);
+
+  // 計算重生時間區間（最早和最晚）
+  const respawnDateTimeMin = new Date(
+    killDateTime.getTime() + bossInfo.respawnMinutesMin * 60 * 1000
+  );
+  const respawnDateTimeMax = new Date(
+    killDateTime.getTime() + bossInfo.respawnMinutesMax * 60 * 1000
+  );
+
+  // 檢查是否已存在相同 BOSS 和頻道的記錄
+  const existingRecordIndex = killRecords.value.findIndex(
+    (record) =>
+      record.bossId === addRecordForm.value.boss &&
+      record.channel === addRecordForm.value.channel
+  );
+
+  const recordData = {
+    bossId: addRecordForm.value.boss,
+    bossName: bossInfo.name,
+    channel: addRecordForm.value.channel,
+    killTime: killDateTime.toISOString(),
+    respawnTimeMin: respawnDateTimeMin.toISOString(),
+    respawnTimeMax: respawnDateTimeMax.toISOString(),
+    killLocation: addRecordForm.value.killLocation,
+    loot: addRecordForm.value.loot,
+    respawnMinutesMin: bossInfo.respawnMinutesMin,
+    respawnMinutesMax: bossInfo.respawnMinutesMax,
+    checkPoints: [], // 踩點記錄
+  };
+
+  if (existingRecordIndex !== -1) {
+    // 如果存在，更新該記錄（保留原有的 id 和踩點記錄）
+    killRecords.value[existingRecordIndex] = {
+      ...recordData,
+      id: killRecords.value[existingRecordIndex].id,
+      checkPoints: killRecords.value[existingRecordIndex].checkPoints || [],
+    };
+  } else {
+    // 如果不存在，新增記錄
+    const newRecord = {
+      ...recordData,
+      id: Date.now(),
+      checkPoints: [],
+    };
+    killRecords.value.unshift(newRecord); // 新記錄放在最前面
+  }
+
+  saveRecords();
+
+  isAddRecordModalOpen.value = false;
+  addRecordForm.value = {
+    boss: addRecordForm.value.boss,
+    channel: "",
+    killTime: "",
+    killLocation: "",
+    loot: "",
+  };
+};
+
+// 成功擊殺 新增紀錄
+const reAddRecord = (record) => {
+  const bossInfo = bossConfig.find((b) => b.id === record.bossId);
+
+  if (!bossInfo) {
+    alert("找不到 BOSS 資料");
+    return;
+  }
+
+  // 獲取當前時間
+  const killDateTime = new Date();
+
+  // 計算重生時間區間（最早和最晚）
+  const respawnDateTimeMin = new Date(
+    killDateTime.getTime() + bossInfo.respawnMinutesMin * 60 * 1000
+  );
+  const respawnDateTimeMax = new Date(
+    killDateTime.getTime() + bossInfo.respawnMinutesMax * 60 * 1000
+  );
+
+  // 檢查是否已存在相同 BOSS 和頻道的記錄
+  const existingRecordIndex = killRecords.value.findIndex(
+    (r) => r.bossId === record.bossId && r.channel === record.channel
+  );
+
+  const recordData = {
+    bossId: record.bossId,
+    bossName: record.bossName,
+    channel: record.channel,
+    killTime: killDateTime.toISOString(),
+    respawnTimeMin: respawnDateTimeMin.toISOString(),
+    respawnTimeMax: respawnDateTimeMax.toISOString(),
+    killLocation: record.killLocation || "",
+    loot: record.loot || "",
+    respawnMinutesMin: bossInfo.respawnMinutesMin,
+    respawnMinutesMax: bossInfo.respawnMinutesMax,
+    checkPoints: [], // 重置踩點記錄
+  };
+
+  if (existingRecordIndex !== -1) {
+    // 如果存在，更新該記錄（保留原有的 id）
+    killRecords.value[existingRecordIndex] = {
+      ...recordData,
+      id: killRecords.value[existingRecordIndex].id,
+      checkPoints: [], // 重置踩點記錄
+    };
+  } else {
+    // 如果不存在，新增記錄
+    const newRecord = {
+      ...recordData,
+      id: Date.now(),
+      checkPoints: [],
+    };
+    killRecords.value.unshift(newRecord); // 新記錄放在最前面
+  }
+
+  saveRecords();
+};
+
+// ===== 踩點記錄功能 =====
+// 添加踩點記錄
+const addCheckPoint = (record) => {
+  if (!record.checkPoints) {
+    record.checkPoints = [];
+  }
+
+  const checkPoint = {
+    time: new Date().toISOString(),
+    note: "已查看，沒有 BOSS",
+  };
+
+  record.checkPoints.push(checkPoint);
+  saveRecords();
+};
+
+// 刪除單個踩點記錄
+const deleteCheckPoint = (record, index) => {
+  if (!record.checkPoints) return;
+
+  // 反轉索引（因為顯示時是反轉的）
+  const actualIndex = record.checkPoints.length - 1 - index;
+  record.checkPoints.splice(actualIndex, 1);
+  saveRecords();
+};
+
+// 獲取最近的踩點時間
+const getLatestCheckPoint = (record) => {
+  if (!record.checkPoints || record.checkPoints.length === 0) {
+    return null;
+  }
+  return record.checkPoints[record.checkPoints.length - 1];
+};
+
+// 格式化踩點時間顯示
+const formatCheckPointTime = (checkPoint) => {
+  if (!checkPoint) return "";
+  const time = new Date(checkPoint.time);
+  const now = new Date();
+
+  // 獲取 HH:MM 格式
+  const hours = String(time.getHours()).padStart(2, "0");
+  const minutes = String(time.getMinutes()).padStart(2, "0");
+  const timeStr = `${hours}:${minutes}`;
+
+  // 計算距離現在多久
+  const diffMs = now - time;
+  const diffMins = Math.floor(diffMs / 60000);
+
+  if (diffMins < 1) {
+    return `剛剛踩點`;
+  } else if (diffMins < 60) {
+    return `${diffMins} 分鐘前踩點`;
+  } else {
+    const diffHours = Math.floor(diffMins / 60);
+    return `${diffHours} 小時前踩點`;
+  }
+};
+
+// BOSS 資料（保留原有的，暫時不刪除以免影響其他功能）
+const bosses = ref([]);
+
+const currentTime = ref(Date.now());
+let intervalId = null;
+
+// 儲存記錄
+const saveRecords = () => {
+  localStorage.setItem("killRecords", JSON.stringify(killRecords.value));
+};
+
+// 載入記錄
+const loadRecords = () => {
+  const saved = localStorage.getItem("killRecords");
+  if (saved) {
+    killRecords.value = JSON.parse(saved);
+  }
+};
+
+// ===== 分享 / 匯入記錄 =====
+const isImportModalOpen = ref(false);
+const importPasteText = ref("");
+
+// 將記錄編碼為可分享字串（UTF-8 安全 base64）
+const encodeShareData = (records) => {
+  const json = JSON.stringify(records);
+  return btoa(unescape(encodeURIComponent(json)));
+};
+
+// 解碼分享字串（先嘗試 base64，失敗則當作純 JSON）
+const decodeShareData = (raw) => {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  let jsonStr = trimmed;
+  try {
+    if (/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+      jsonStr = decodeURIComponent(escape(atob(trimmed)));
+    }
+  } catch (_) {}
+  try {
+    return JSON.parse(jsonStr);
+  } catch (_) {
+    return null;
+  }
+};
+
+// 分享：複製到剪貼簿
+const shareRecords = async () => {
+  if (killRecords.value.length === 0) {
+    alert("目前沒有記錄可分享");
+    return;
+  }
+  const encoded = encodeShareData(killRecords.value);
+  try {
+    await navigator.clipboard.writeText(encoded);
+    alert("已複製到剪貼簿！可貼上傳給他人，對方用「匯入分享資料」即可一鍵匯入。");
+  } catch (e) {
+    alert("複製失敗，請手動複製：\n\n" + encoded);
+  }
+};
+
+// 匯入時合併：同一 BOSS + 頻道只保留較新的擊殺記錄，其餘加總
+const mergeImportedRecords = (existing, imported) => {
+  if (!Array.isArray(imported)) return existing;
+  const byKey = {};
+  const key = (r) => `${r.bossId}_${r.channel}`;
+  existing.forEach((r) => {
+    byKey[key(r)] = { ...r };
+  });
+  imported.forEach((r) => {
+    const k = key(r);
+    const existingRecord = byKey[k];
+    if (!existingRecord) {
+      byKey[k] = { ...r, id: r.id ?? Date.now() + Math.random() };
+    } else {
+      const existingTime = new Date(existingRecord.killTime).getTime();
+      const importedTime = new Date(r.killTime).getTime();
+      if (importedTime > existingTime) {
+        byKey[k] = { ...r, id: existingRecord.id };
+      }
+    }
+  });
+  const list = Object.values(byKey);
+  list.sort((a, b) => new Date(a.respawnTimeMin).getTime() - new Date(b.respawnTimeMin).getTime());
+  return list;
+};
+
+const openImportModal = () => {
+  importPasteText.value = "";
+  isImportModalOpen.value = true;
+};
+
+const closeImportModal = () => {
+  isImportModalOpen.value = false;
+  importPasteText.value = "";
+};
+
+const doImport = () => {
+  const parsed = decodeShareData(importPasteText.value);
+  if (!parsed || !Array.isArray(parsed) || parsed.length === 0) {
+    alert("無法辨識的資料，請貼上他人分享的完整內容。");
+    return;
+  }
+  const merged = mergeImportedRecords(killRecords.value, parsed);
+  killRecords.value = merged;
+  saveRecords();
+  closeImportModal();
+  alert(`已匯入並合併，目前共 ${merged.length} 筆記錄。`);
+};
+
+// 點擊外部關閉下拉選單
+const closeDropdownOnClickOutside = (event) => {
+  const dropdown = document.querySelector(".relative.w-96");
+  if (dropdown && !dropdown.contains(event.target)) {
+    isDropdownOpen.value = false;
+  }
+};
+
+// 全局鍵盤快捷鍵
+const handleKeyboardShortcut = (event) => {
+  // 如果正在輸入框中，不觸發快捷鍵
+  const target = event.target;
+  if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+    return;
+  }
+
+  // 主鍵盤：+（常與 Shift 同按）或 =；數字鍵盤：NumpadAdd（NumLock 開啟時通常 key 也是 "+"，另寫 code 較穩）
+  if (
+    event.key === "+" ||
+    event.key === "=" ||
+    event.code === "NumpadAdd"
+  ) {
+    event.preventDefault();
+    
+    if (!isAddRecordModalOpen.value) {
+      openAddRecordModal();
+    }
+  }
+};
+
+// 載入儲存的資料
+onMounted(() => {
+  loadRecords();
+  loadFavoriteBossIds();
+
+  const saved = localStorage.getItem("bossTimers");
+  if (saved) {
+    const data = JSON.parse(saved);
+    bosses.value = data.map((boss) => ({
+      ...boss,
+      lastKillTime: boss.lastKillTime ? new Date(boss.lastKillTime) : null,
+    }));
+  }
+
+  // 每秒更新時間
+  intervalId = setInterval(() => {
+    currentTime.value = Date.now();
+  }, 1000);
+
+  // 監聽點擊事件來關閉下拉選單
+  document.addEventListener("click", closeDropdownOnClickOutside);
+  
+  // 監聽鍵盤快捷鍵
+  document.addEventListener("keydown", handleKeyboardShortcut);
+});
+
+onUnmounted(() => {
+  if (intervalId) {
+    clearInterval(intervalId);
+  }
+  // 清除事件監聽器
+  document.removeEventListener("click", closeDropdownOnClickOutside);
+  document.removeEventListener("keydown", handleKeyboardShortcut);
+});
+
+// 儲存資料（保留原有的）
+const saveData = () => {
+  localStorage.setItem("bossTimers", JSON.stringify(bosses.value));
+};
+
+// 記錄擊殺時間
+const recordKill = (boss) => {
+  boss.lastKillTime = new Date();
+  saveData();
+};
+
+// 重置計時器
+const resetTimer = (boss) => {
+  boss.lastKillTime = null;
+  saveData();
+};
+
+// 計算剩餘時間
+const getRemainingTime = (boss) => {
+  if (!boss.lastKillTime) return null;
+
+  const killTime = new Date(boss.lastKillTime).getTime();
+  const respawnTime = killTime + boss.spawnTime * 1000;
+  const remaining = respawnTime - currentTime.value;
+
+  if (remaining <= 0) return 0;
+  return Math.floor(remaining / 1000);
+};
+
+// 格式化時間顯示
+const formatTime = (seconds) => {
+  if (seconds === null) return "--:--:--";
+
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(
+    2,
+    "0"
+  )}:${String(secs).padStart(2, "0")}`;
+};
+
+// 格式化重生時間
+const formatRespawnTime = (boss) => {
+  if (!boss.lastKillTime) return "尚未擊殺";
+
+  const killTime = new Date(boss.lastKillTime).getTime();
+  const respawnTime = new Date(killTime + boss.spawnTime * 1000);
+
+  return respawnTime.toLocaleString("zh-TW", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+};
+
+// 判斷是否已重生
+const isRespawned = (boss) => {
+  const remaining = getRemainingTime(boss);
+  return remaining !== null && remaining === 0;
+};
+
+// 新增 BOSS
+const addBoss = () => {
+  const newId = Math.max(...bosses.value.map((b) => b.id), 0) + 1;
+  bosses.value.push({
+    id: newId,
+    name: `BOSS ${newId}`,
+    spawnTime: 30 * 60,
+    lastKillTime: null,
+    note: "",
+  });
+  saveData();
+};
+
+// 刪除 BOSS
+const removeBoss = (bossId) => {
+  bosses.value = bosses.value.filter((b) => b.id !== bossId);
+  saveData();
+};
+
+// 編輯模式
+const editingBoss = ref(null);
+const editForm = ref({
+  name: "",
+  spawnTime: 30,
+  note: "",
+});
+
+const startEdit = (boss) => {
+  editingBoss.value = boss.id;
+  editForm.value = {
+    name: boss.name,
+    spawnTime: boss.spawnTime / 60,
+    note: boss.note,
+  };
+};
+
+const saveEdit = (boss) => {
+  boss.name = editForm.value.name;
+  boss.spawnTime = editForm.value.spawnTime * 60;
+  boss.note = editForm.value.note;
+  editingBoss.value = null;
+  saveData();
+};
+
+const cancelEdit = () => {
+  editingBoss.value = null;
+};
+
+// ===== 記錄列表相關功能 =====
+
+// 刪除記錄
+const deleteRecord = (recordId) => {
+  //   if (confirm("確定要刪除這筆記錄嗎？")) {
+  //   }
+  killRecords.value = killRecords.value.filter((r) => r.id !== recordId);
+  saveRecords();
+};
+
+// 格式化重生時間區間：若最早與最晚相同（固定重生時間）只顯示一個時間
+const formatRespawnTimeRange = (record) => {
+  const minT = new Date(record.respawnTimeMin).getTime();
+  const maxT = new Date(record.respawnTimeMax).getTime();
+  const str = formatDisplayTime(record.respawnTimeMin);
+  if (minT === maxT) return str;
+  return `${str} ~ ${formatDisplayTime(record.respawnTimeMax)}`;
+};
+
+// 格式化顯示時間
+const formatDisplayTime = (isoString) => {
+  const date = new Date(isoString);
+  const now = new Date();
+
+  // 判斷是否為當天
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  // 如果是當天，只顯示時間
+  if (isToday) {
+    return date.toLocaleString("zh-TW", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  }
+
+  // 如果不是當天，顯示日期和時間
+  return date.toLocaleString("zh-TW", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+};
+
+// 計算記錄的倒數計時
+const getRecordCountdown = (record) => {
+  const now = currentTime.value;
+  const respawnMin = new Date(record.respawnTimeMin).getTime();
+  const respawnMax = new Date(record.respawnTimeMax).getTime();
+
+  // 如果還沒到最早重生時間
+  if (now < respawnMin) {
+    const remaining = Math.floor((respawnMin - now) / 1000);
+    return {
+      status: "waiting",
+      text: "即將重生",
+      timeText: formatCountdownTime(remaining),
+      remaining,
+      percentage: 0,
+    };
+  }
+
+  // 如果在重生時間範圍內
+  if (now >= respawnMin && now < respawnMax) {
+    const remaining = Math.floor((respawnMax - now) / 1000);
+    const totalDuration = respawnMax - respawnMin;
+    const elapsed = now - respawnMin;
+    const percentage = Math.min(
+      100,
+      Math.max(0, (elapsed / totalDuration) * 100)
+    );
+
+    return {
+      status: "respawning",
+      text: "可能已重生",
+      timeText: formatCountdownTime(remaining),
+      remaining,
+      percentage: Math.round(percentage),
+    };
+  }
+
+  // 如果已過最晚重生時間
+  return {
+    status: "respawned",
+    text: "已重生",
+    timeText: "00:00:00",
+    remaining: 0,
+    percentage: 100,
+  };
+};
+
+// 格式化倒數時間
+const formatCountdownTime = (seconds) => {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(
+    2,
+    "0"
+  )}:${String(secs).padStart(2, "0")}`;
+};
+</script>
+
+<template>
+  <div class="container mx-auto px-4 py-8 max-w-6xl">
+    <!-- 標題 & 功能按鈕 (清除、分享、使用說明) -->
+    <div class="flex justify-between items-center mb-8">
+      <h1 class="text-2xl font-bold text-white">ARTIFACT 野王計時器 v1.0</h1>
+      <div class="flex flex-wrap gap-2">
+        <button
+          class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-md flex items-center gap-2 transition"
+          @click="shareRecords"
+          title="複製目前所有記錄，可貼上分享給他人"
+        >
+          <ShareIcon class="w-4 h-4" />
+          分享資料
+        </button>
+        <button
+          class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-md flex items-center gap-2 transition"
+          @click="openImportModal"
+          title="貼上他人分享的資料，一鍵匯入並與現有記錄合併"
+        >
+          <DocumentTextIcon class="w-4 h-4" />
+          匯入分享資料
+        </button>
+        <button
+          class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-md flex items-center gap-2 transition"
+          @click="clearRecordsLocal"
+        >
+          <TrashIcon class="w-4 h-4" />
+          清除所有紀錄
+        </button>
+        <!-- <button
+          class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-md flex items-center gap-2 transition"
+        >
+          <ShareIcon class="w-4 h-4" />
+          分享
+        </button> -->
+        <!-- <button
+          class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-md flex items-center gap-2 transition"
+        >
+          <DocumentTextIcon class="w-4 h-4" />
+          使用說明
+        </button> -->
+      </div>
+    </div>
+
+    <!-- 
+    * 新增一筆紀錄
+      選擇一個BOSS 新增按鈕
+      彈窗填寫資料：頻道、擊殺時間(預設當下 可調整)、擊殺地點(特定 BOSS 才要)、收穫的寶物(後續再加)
+    -->
+    <div
+      class="flex flex-col items-end fixed right-0 bottom-0 gap-2 bg-gray-950 bg-opacity-50 backdrop-blur-sm p-3 w-full max-w-[480px] ml-auto z-20 rounded-tl-lg"
+    >
+      <div class="flex justify-end gap-2 w-full">
+        <!-- 自定義下拉選單 -->
+        <div class="relative w-full">
+          <!-- 選單按鈕 -->
+          <button
+            @click="isDropdownOpen = !isDropdownOpen"
+            class="w-full bg-gray-700 text-white px-4 py-2 rounded-md flex items-center justify-between hover:bg-gray-600 transition"
+          >
+            <span v-if="!selectedBossConfig" class="text-gray-400"
+              >選擇一個BOSS</span
+            >
+            <span v-else class="flex items-center gap-2">
+              <div class="w-8 h-8 flex-shrink-0">
+                <img
+                  :src="getBossImage(selectedBossConfig.id)"
+                  :alt="selectedBossConfig.name"
+                  class="w-full h-full object-contain"
+                />
+              </div>
+              <span>{{ selectedBossConfig.name }}</span>
+              <span class="text-xs text-gray-400"
+                >({{ selectedBossConfig.description }})</span
+              >
+            </span>
+            <svg
+              class="w-5 h-5 transition-transform"
+              :class="{ 'rotate-180': isDropdownOpen }"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M19 9l-7 7-7-7"
+              ></path>
+            </svg>
+          </button>
+
+          <!-- 下拉選單內容 -->
+          <div
+            v-show="isDropdownOpen"
+            class="absolute z-10 w-full bottom-full mb-2 bg-gray-800 border border-gray-600 rounded-lg shadow-xl max-h-96 overflow-hidden"
+          >
+            <!-- 搜尋框 -->
+            <div class="p-2 border-b border-gray-600">
+              <div class="relative">
+                <MagnifyingGlassIcon
+                  class="w-4 h-4 absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400"
+                />
+                <input
+                  v-model="dropdownSearch"
+                  type="text"
+                  placeholder="搜尋 BOSS 名稱..."
+                  class="w-full bg-gray-700 text-white pl-9 pr-3 py-2 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  @click.stop
+                />
+              </div>
+            </div>
+
+            <!-- BOSS 列表 -->
+            <div class="overflow-y-auto max-h-80">
+              <button
+                v-for="boss in filteredBosses"
+                :key="boss.id"
+                @click="selectBoss(boss.id)"
+                class="w-full px-4 py-3 flex items-center gap-3 hover:bg-gray-700 transition text-left"
+                :class="{ 'bg-gray-700': addRecordForm.boss === boss.id }"
+              >
+                <div class="w-12 h-12 flex-shrink-0">
+                  <img
+                    :src="getBossImage(boss.id)"
+                    :alt="boss.name"
+                    class="w-full h-full object-contain"
+                  />
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="text-white font-medium">{{ boss.name }}</div>
+                  <div class="text-xs text-gray-400">
+                    {{ boss.description }}
+                  </div>
+                  <div
+                    class="text-xs text-gray-500 truncate"
+                    v-if="boss.location.length > 0"
+                  >
+                    📍 {{ boss.location[0] }}
+                  </div>
+                </div>
+                <span
+                  role="button"
+                  :title="isBossFavorite(boss.id) ? '取消最愛' : '加入最愛'"
+                  @click.stop="toggleFavoriteBoss(boss.id)"
+                  class="flex-shrink-0"
+                >
+                  <StarSolidIcon
+                    class="w-5 h-5 transition"
+                    :class="
+                      isBossFavorite(boss.id)
+                        ? 'text-yellow-300 drop-shadow-[0_0_6px_rgba(250,204,21,0.8)]'
+                        : 'text-gray-500 opacity-80 hover:opacity-100'
+                    "
+                  />
+                </span>
+              </button>
+              <div
+                v-if="filteredBosses.length === 0"
+                class="px-4 py-8 text-center text-gray-500"
+              >
+                找不到符合的 BOSS
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button
+          class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md transition flex items-center gap-2"
+          @click="openAddRecordModal"
+        >
+          <PlusIcon class="w-5 h-5" />
+        </button>
+      </div>
+
+      <!-- 新增一筆紀錄的彈窗 -->
+      <div
+        class="w-full"
+        v-if="isAddRecordModalOpen"
+        @click.self="closeAddRecordModal"
+      >
+        <div class="bg-gray-800 p-6 rounded-lg w-full">
+          <h3 class="text-xl font-bold text-white mb-4">
+            新增擊殺記錄 - {{ selectedBossConfig?.name }}
+          </h3>
+
+          <div class="flex flex-col space-y-4">
+            <div>
+              <label for="channel" class="text-white block mb-2">
+                頻道 <span class="text-red-600">*</span>
+              </label>
+              <input
+                ref="channelInputRef"
+                type="number"
+                min="1"
+                max="9999"
+                id="channel"
+                class="bg-gray-700 text-white px-4 py-2 rounded-md w-full"
+                placeholder="例如: 1111"
+                v-model="addRecordForm.channel"
+                @keyup.enter="addRecord"
+              />
+            </div>
+
+            <div>
+              <label class="text-white block mb-2">
+                擊殺時間 <span class="text-red-600">*</span>
+                <span class="text-gray-400 text-sm font-normal">（24 小時制）</span>
+              </label>
+              <div class="flex gap-2 items-center">
+                <input
+                  type="number"
+                  min="0"
+                  max="23"
+                  class="bg-gray-700 text-white px-4 py-2 rounded-md flex-1 text-center"
+                  placeholder="時"
+                  :value="killTimeHour"
+                  @input="onKillTimeHourInput"
+                />
+                <span class="text-gray-400">:</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="59"
+                  class="bg-gray-700 text-white px-4 py-2 rounded-md flex-1 text-center"
+                  placeholder="分"
+                  :value="killTimeMinute"
+                  @input="onKillTimeMinuteInput"
+                />
+              </div>
+            </div>
+
+            <!-- <div v-if="selectedBossConfig?.needLocation">
+              <label for="killLocation" class="text-white block mb-2">
+                擊殺地點
+              </label>
+              <input
+                type="text"
+                id="killLocation"
+                class="bg-gray-700 text-white px-4 py-2 rounded-md w-full"
+                placeholder="例如: 北方洞穴"
+                v-model="addRecordForm.killLocation"
+              />
+            </div> -->
+
+            <!-- <div>
+              <label for="loot" class="text-white block mb-2">收穫的寶物</label>
+              <input
+                type="text"
+                id="loot"
+                class="bg-gray-700 text-white px-4 py-2 rounded-md w-full"
+                placeholder="例如: 紫裝、材料"
+                v-model="addRecordForm.loot"
+              />
+            </div> -->
+
+            <div class="flex gap-2 mt-4">
+              <button
+                class="flex-1 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-md transition flex items-center justify-center gap-2"
+                @click="closeAddRecordModal"
+              >
+                取消
+              </button>
+              <button
+                :disabled="
+                  !(
+                    addRecordForm.channel &&
+                    addRecordForm.killTime &&
+                    addRecordForm.boss
+                  )
+                "
+                class="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-500 disabled:cursor-not-allowed disabled:opacity-50 text-white px-4 py-2 rounded-md transition flex items-center justify-center gap-2"
+                @click="addRecord"
+              >
+                新增
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 匯入分享資料彈窗 -->
+    <div
+      v-if="isImportModalOpen"
+      class="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4"
+      @click.self="closeImportModal"
+    >
+      <div class="bg-gray-800 rounded-xl p-6 w-full max-w-lg shadow-xl">
+        <h3 class="text-lg font-bold text-white mb-2">匯入分享資料</h3>
+        <p class="text-gray-400 text-sm mb-3">
+          貼上他人分享的資料，將與您目前的記錄合併；同一 BOSS＋頻道會保留較新的擊殺時間。
+        </p>
+        <textarea
+          v-model="importPasteText"
+          class="w-full h-40 bg-gray-700 text-white rounded-lg px-3 py-2 text-sm font-mono resize-none focus:ring-2 focus:ring-blue-500 focus:outline-none"
+          placeholder="請貼上他人分享的內容（整段複製）"
+        />
+        <div class="flex gap-2 mt-4">
+          <button
+            class="flex-1 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-md transition"
+            @click="closeImportModal"
+          >
+            取消
+          </button>
+          <button
+            class="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md transition"
+            @click="doImport"
+          >
+            匯入並合併
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 記錄列表 -->
+    <div class="border border-gray-700 rounded-xl p-4">
+      <!-- 空狀態 -->
+      <div
+        v-if="killRecords.length === 0"
+        class="bg-gray-800 rounded-lg p-8 text-center"
+      >
+        <p class="text-gray-400 text-lg">尚無記錄</p>
+        <p class="text-gray-500 text-sm mt-2">選擇一個 BOSS 開始記錄吧！</p>
+      </div>
+
+      <!-- 分組顯示 -->
+      <div v-else class="space-y-4">
+        <!-- 已重生區塊（預設隱藏，可展開） -->
+        <template v-if="groupedRecords.respawned.length > 0">
+          <div
+            v-if="!showRespawnedSection"
+            class="border border-dashed border-gray-600 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 bg-gray-900/50"
+          >
+            <div class="flex items-center gap-2 min-w-0">
+              <div class="w-3 h-3 rounded-full bg-sky-500 shrink-0"></div>
+              <span class="text-sky-400 font-semibold">已重生</span>
+              <span class="text-gray-500 text-sm"
+                >共 {{ groupedRecords.respawned.length }} 筆（預設隱藏）</span>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 px-3 py-1.5 rounded-md bg-sky-700/90 hover:bg-sky-600 text-white text-sm transition"
+              @click="showRespawnedSection = true"
+            >
+              展開
+            </button>
+          </div>
+          <div v-else class="border border-gray-700 rounded-xl p-4">
+          <div
+            class="flex flex-wrap items-center justify-between gap-2 mb-3"
+          >
+            <div class="flex items-center gap-2">
+              <div class="w-3 h-3 rounded-full bg-sky-500"></div>
+              <h3 class="text-lg font-bold text-sky-400">
+                已重生 ({{ groupedRecords.respawned.length }})
+              </h3>
+            </div>
+            <div class="flex flex-wrap items-center justify-end gap-1.5 text-sm">
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md bg-gray-700 text-gray-300 hover:bg-gray-600 transition mr-1"
+                @click="showRespawnedSection = false"
+              >
+                收合
+              </button>
+              <span class="text-gray-500 shrink-0">排序</span>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.respawned === 'time'
+                    ? 'bg-sky-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.respawned = 'time'"
+              >
+                時間
+              </button>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.respawned === 'channel'
+                    ? 'bg-sky-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.respawned = 'channel'"
+              >
+                頻道
+              </button>
+            </div>
+          </div>
+          <div class="space-y-4">
+            <div
+              v-for="(record, index) in sortedGroupedRecords.respawned"
+              :key="record.id"
+              class="rounded-lg px-4 py-1 transition border-l-4 border-sky-500"
+              :class="
+                showChannelProximityRowBg('respawned', index)
+                  ? 'bg-[rgba(57,255,20,0.14)] hover:bg-[rgba(57,255,20,0.22)] shadow-[0_0_18px_rgba(57,255,20,0.35)] ring-1 ring-[#39ff14]/45'
+                  : 'bg-gray-800 hover:bg-gray-750'
+              "
+            >
+              <div class="flex items-center gap-4">
+                <!-- BOSS 圖片 -->
+                <div class="w-8 h-8 flex-shrink-0">
+                  <img
+                    :src="getBossImage(record.bossId)"
+                    :alt="record.bossName"
+                    class="pic-auto"
+                  />
+                </div>
+
+                <!-- 主要資訊 -->
+                <div class="flex-1 flex flex-col min-w-0">
+                  <div class="flex items-center gap-3 justify-between mb-1">
+                    <!-- BOSS 名稱 & 頻道 -->
+                    <div class="flex items-center gap-2">
+                      <h3 class="text-md text-gray-200">
+                        {{ record.bossName }}
+                      </h3>
+                      <span class="text-gray-400">|</span>
+                      <span class="text-gray-400 text-sm font-medium">
+                        頻道 {{ record.channel }}
+                      </span>
+                    </div>
+
+                    <!-- 時間資訊 -->
+                    <div class="text-sm">
+                      <div class="flex items-center gap-1">
+                        <ClockIcon class="w-3.5 h-3.5 text-blue-400" />
+                        <span class="text-gray-200">
+                          {{ formatRespawnTimeRange(record) }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 踩點記錄顯示 -->
+                  <div
+                    v-if="record.checkPoints && record.checkPoints.length > 0"
+                    class="text-xs text-gray-400"
+                  >
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <EyeIcon class="w-3 h-3 flex-shrink-0" />
+                      <span>{{
+                        formatCheckPointTime(getLatestCheckPoint(record))
+                      }}</span>
+                      <span
+                        v-for="(checkPoint, index) in [
+                          ...record.checkPoints,
+                        ].reverse()"
+                        :key="index"
+                        class="group relative text-gray-400 text-xs bg-gray-900/80 px-1 py-0.5 rounded cursor-pointer transition-colors"
+                        @click.stop="deleteCheckPoint(record, index)"
+                        title="點擊刪除此踩點記錄"
+                      >
+                        {{
+                          new Date(checkPoint.time).toLocaleTimeString(
+                            "zh-TW",
+                            {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: false,
+                            }
+                          )
+                        }}
+                        <XMarkIcon
+                          class="w-5 h-5 font-bold absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-red-600 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                        />
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 倒數計時 & 操作按鈕 -->
+                <div class="flex items-center gap-3 flex-shrink-0">
+                  <!-- 倒數計時 -->
+                  <div
+                    class="text-center px-4 py-1 rounded-lg"
+                    :class="{
+                      'bg-yellow-900/50 border border-yellow-500':
+                        getRecordCountdown(record).status === 'waiting',
+                      'bg-green-900/50 border border-green-500 animate-pulse':
+                        getRecordCountdown(record).status === 'respawning',
+                      'bg-sky-900/50 border border-sky-500':
+                        getRecordCountdown(record).status === 'respawned',
+                    }"
+                  >
+                    <div
+                      class="text-xs font-semibold"
+                      :class="{
+                        'text-yellow-400':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-400':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-sky-400':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ formatDisplayTime(record.respawnTimeMax) }}
+                    </div>
+                    <div
+                      class="text-xs"
+                      :class="{
+                        'text-yellow-300':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-300':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-sky-300':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ getRecordCountdown(record).text }}
+                    </div>
+                  </div>
+
+                  <!-- 成功擊殺 重新計時 -->
+                  <button
+                    @click="reAddRecord(record)"
+                    class="border border-green-600 hover:bg-green-700 hover:text-white text-green-600 p-2 rounded text-sm transition"
+                    title="重新計時"
+                  >
+                    <CheckBadgeIcon class="w-5 h-5" />
+                  </button>
+
+                  <!-- 刪除按鈕 -->
+                  <button
+                    @click="deleteRecord(record.id)"
+                    class="border border-red-600 hover:bg-red-700 hover:text-white text-red-600 p-2 rounded text-sm transition"
+                    title="刪除記錄"
+                  >
+                    <TrashIcon class="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          </div>
+        </template>
+
+        <!-- 可能已重生區塊 -->
+        <div
+          v-if="groupedRecords.respawning.length > 0"
+          class="border border-gray-700 rounded-xl p-4"
+        >
+          <div
+            class="flex flex-wrap items-center justify-between gap-2 mb-3"
+          >
+            <div class="flex items-center gap-2">
+              <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
+              <h3 class="text-lg font-bold text-green-400">
+                可能已重生 ({{ groupedRecords.respawning.length }})
+              </h3>
+            </div>
+            <div class="flex items-center gap-1.5 text-sm">
+              <span class="text-gray-500 shrink-0">排序</span>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.respawning === 'time'
+                    ? 'bg-green-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.respawning = 'time'"
+              >
+                時間
+              </button>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.respawning === 'channel'
+                    ? 'bg-green-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.respawning = 'channel'"
+              >
+                頻道
+              </button>
+            </div>
+          </div>
+          <div class="space-y-4">
+            <div
+              v-for="(record, index) in sortedGroupedRecords.respawning"
+              :key="record.id"
+              class="rounded-lg px-4 py-1 transition border-l-4 border-green-500"
+              :class="
+                showChannelProximityRowBg('respawning', index)
+                  ? 'bg-[rgba(57,255,20,0.14)] hover:bg-[rgba(57,255,20,0.22)] shadow-[0_0_18px_rgba(57,255,20,0.35)] ring-1 ring-[#39ff14]/45'
+                  : 'bg-gray-800 hover:bg-gray-750'
+              "
+            >
+              <div class="flex items-center gap-4">
+                <!-- BOSS 圖片 -->
+                <div class="w-8 h-8 flex-shrink-0">
+                  <img
+                    :src="getBossImage(record.bossId)"
+                    :alt="record.bossName"
+                    class="pic-auto"
+                  />
+                </div>
+
+                <!-- 主要資訊 -->
+                <div class="flex-1 flex flex-col min-w-0">
+                  <div class="flex items-center gap-3 justify-between mb-1">
+                    <!-- BOSS 名稱 & 頻道 -->
+                    <div class="flex items-center gap-2">
+                      <h3 class="text-md text-gray-200">
+                        {{ record.bossName }}
+                      </h3>
+                      <span class="text-gray-400">|</span>
+                      <span class="text-gray-400 text-sm font-medium">
+                        頻道 {{ record.channel }}
+                      </span>
+                    </div>
+
+                    <!-- 時間資訊 -->
+                    <div class="text-sm">
+                      <div class="flex items-center gap-1">
+                        <ClockIcon class="w-3.5 h-3.5 text-blue-400" />
+                        <span class="text-gray-200">
+                          {{ formatRespawnTimeRange(record) }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 重生進度條 -->
+                  <div class="mb-2">
+                    <div class="flex gap-1 w-full items-center">
+                      <div
+                        class="w-full bg-gray-700 rounded-full h-2.5 overflow-hidden"
+                      >
+                        <div
+                          class="h-full bg-gradient-to-r from-yellow-500 via-green-500 to-green-400 transition-all duration-1000 ease-out shadow-lg"
+                          :style="{
+                            width: getRecordCountdown(record).percentage + '%',
+                          }"
+                        ></div>
+                      </div>
+                      <span class="text-xs font-semibold text-green-400">
+                        {{ getRecordCountdown(record).percentage }}%
+                      </span>
+                    </div>
+                  </div>
+
+                  <!-- 踩點記錄顯示 -->
+                  <div
+                    v-if="record.checkPoints && record.checkPoints.length > 0"
+                    class="text-xs text-gray-400"
+                  >
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <EyeIcon class="w-3 h-3 flex-shrink-0" />
+                      <span>{{
+                        formatCheckPointTime(getLatestCheckPoint(record))
+                      }}</span>
+                      <span
+                        v-for="(checkPoint, index) in [
+                          ...record.checkPoints,
+                        ].reverse()"
+                        :key="index"
+                        class="group relative text-gray-400 text-xs bg-gray-900/80 px-1 py-0.5 rounded cursor-pointer transition-colors"
+                        @click.stop="deleteCheckPoint(record, index)"
+                        title="點擊刪除此踩點記錄"
+                      >
+                        {{
+                          new Date(checkPoint.time).toLocaleTimeString(
+                            "zh-TW",
+                            {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: false,
+                            }
+                          )
+                        }}
+                        <XMarkIcon
+                          class="w-5 h-5 font-bold absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-red-600 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                        />
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 倒數計時 & 操作按鈕 -->
+                <div class="flex items-center gap-2 flex-shrink-0">
+                  <!-- 倒數計時 -->
+                  <div
+                    class="text-center px-4 py-1 rounded-lg"
+                    :class="{
+                      'bg-yellow-900/50 border border-yellow-500':
+                        getRecordCountdown(record).status === 'waiting',
+                      'bg-green-900/50 border border-green-500 animate-pulse':
+                        getRecordCountdown(record).status === 'respawning',
+                      'bg-red-900/50 border border-red-500':
+                        getRecordCountdown(record).status === 'respawned',
+                    }"
+                  >
+                    <div
+                      class="text-xs font-semibold"
+                      :class="{
+                        'text-yellow-400':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-400':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-red-400':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ getRecordCountdown(record).text }}
+                    </div>
+                    <div
+                      class="text-sm font-mono font-bold"
+                      :class="{
+                        'text-yellow-300':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-300':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-red-300':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ getRecordCountdown(record).timeText }}
+                    </div>
+                  </div>
+
+                  <!-- 踩點紀錄 -->
+
+                  <!-- 踩點按鈕 -->
+                  <button
+                    @click="addCheckPoint(record)"
+                    class="border border-blue-600 hover:bg-blue-700 hover:text-white text-blue-600 p-2 rounded text-sm transition"
+                    title="踩點記錄（已查看但沒有 BOSS）"
+                  >
+                    <!-- 眼睛 icon -->
+                    <EyeIcon class="w-5 h-5" />
+                  </button>
+
+                  <!-- 成功擊殺 重新計時 -->
+                  <button
+                    @click="reAddRecord(record)"
+                    class="border border-green-600 hover:bg-green-700 hover:text-white text-green-600 p-2 rounded text-sm transition"
+                    title="重新計時"
+                  >
+                    <CheckBadgeIcon class="w-5 h-5" />
+                  </button>
+
+                  <!-- 刪除按鈕 -->
+                  <button
+                    @click="deleteRecord(record.id)"
+                    class="border border-red-600 hover:bg-red-700 hover:text-white text-red-600 p-2 rounded text-sm transition"
+                    title="刪除記錄"
+                  >
+                    <TrashIcon class="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 即將重生區塊 -->
+        <div
+          v-if="groupedRecords.waiting.length > 0"
+          class="border border-gray-700 rounded-xl p-4"
+        >
+          <div
+            class="flex flex-wrap items-center justify-between gap-2 mb-3"
+          >
+            <div class="flex items-center gap-2">
+              <div class="w-3 h-3 rounded-full bg-yellow-500"></div>
+              <h3 class="text-lg font-bold text-yellow-400">
+                即將重生 ({{ groupedRecords.waiting.length }})
+              </h3>
+            </div>
+            <div class="flex items-center gap-1.5 text-sm">
+              <span class="text-gray-500 shrink-0">排序</span>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.waiting === 'time'
+                    ? 'bg-yellow-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.waiting = 'time'"
+              >
+                時間
+              </button>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded-md transition"
+                :class="
+                  groupSortMode.waiting === 'channel'
+                    ? 'bg-yellow-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                "
+                @click="groupSortMode.waiting = 'channel'"
+              >
+                頻道
+              </button>
+            </div>
+          </div>
+          <div class="space-y-4">
+            <div
+              v-for="(record, index) in sortedGroupedRecords.waiting"
+              :key="record.id"
+              class="rounded-lg px-4 py-1 transition border-l-4 border-yellow-500"
+              :class="
+                showChannelProximityRowBg('waiting', index)
+                  ? 'bg-[rgba(57,255,20,0.14)] hover:bg-[rgba(57,255,20,0.22)] shadow-[0_0_18px_rgba(57,255,20,0.35)] ring-1 ring-[#39ff14]/45'
+                  : 'bg-gray-800 hover:bg-gray-750'
+              "
+            >
+              <div class="flex items-center gap-4">
+                <!-- BOSS 圖片 -->
+                <div class="w-8 h-8 flex-shrink-0">
+                  <img
+                    :src="getBossImage(record.bossId)"
+                    :alt="record.bossName"
+                    class="pic-auto"
+                  />
+                </div>
+
+                <!-- 主要資訊 -->
+                <div class="flex-1 flex justify-between items-center min-w-0">
+                  <!-- BOSS 名稱 & 頻道 -->
+                  <div class="flex items-center gap-2">
+                    <h3 class="text-md text-gray-200">
+                      {{ record.bossName }}
+                    </h3>
+                    <span class="text-gray-400">|</span>
+                    <span class="text-gray-400 text-sm font-medium">
+                      頻道 {{ record.channel }}
+                    </span>
+                  </div>
+
+                  <!-- 時間資訊 -->
+                  <div class="text-sm">
+                    <div class="flex items-center gap-1">
+                      <ClockIcon class="w-3.5 h-3.5 text-blue-400" />
+                      <span class="text-gray-200">
+                        {{ formatRespawnTimeRange(record) }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 倒數計時 & 操作按鈕 -->
+                <div class="flex items-center gap-2 flex-shrink-0">
+                  <!-- 倒數計時 -->
+                  <div
+                    class="text-center px-4 py-1 rounded-lg"
+                    :class="{
+                      'bg-yellow-900/50 border border-yellow-500':
+                        getRecordCountdown(record).status === 'waiting',
+                      'bg-green-900/50 border border-green-500 animate-pulse':
+                        getRecordCountdown(record).status === 'respawning',
+                      'bg-red-900/50 border border-red-500':
+                        getRecordCountdown(record).status === 'respawned',
+                    }"
+                  >
+                    <div
+                      class="text-xs font-semibold"
+                      :class="{
+                        'text-yellow-400':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-400':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-red-400':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ getRecordCountdown(record).text }}
+                    </div>
+                    <div
+                      class="text-sm font-mono font-bold"
+                      :class="{
+                        'text-yellow-300':
+                          getRecordCountdown(record).status === 'waiting',
+                        'text-green-300':
+                          getRecordCountdown(record).status === 'respawning',
+                        'text-red-300':
+                          getRecordCountdown(record).status === 'respawned',
+                      }"
+                    >
+                      {{ getRecordCountdown(record).timeText }}
+                    </div>
+                  </div>
+
+                  <!-- 刪除按鈕 -->
+                  <button
+                    @click="deleteRecord(record.id)"
+                    class="border border-red-600 hover:bg-red-700 hover:text-white text-red-600 p-2 rounded text-sm transition"
+                    title="刪除記錄"
+                  >
+                    <TrashIcon class="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 頁尾 -->
+    <div class="text-center text-white/50 text-sm min-h-[88px] py-4">
+      <p>
+        快捷鍵：主鍵盤 + 或 =、或數字鍵盤 + 打開新增彈窗；輸入完頻道後按 Enter 確認新增
+      </p>
+      <p class="flex flex-wrap items-center justify-center gap-2">
+        <span>頻道排序時，與上一筆或下一筆頻道號差距 ≤</span>
+        <input
+          v-model.number="channelProximityN"
+          type="number"
+          min="0"
+          max="99999"
+          class="w-16 bg-gray-800 border border-gray-600 rounded px-2 py-0.5 text-center text-white text-sm"
+        />
+        <span>時，該列以霓虹綠底標示</span>
+      </p>
+      <p>眼睛圖示用法：已查看但沒有 BOSS，點擊後會新增踩點記錄，踩點時間點擊可以刪除。</p>
+      <p>教學還在生產中，請見諒 🫡</p>
+      <br>
+      <p>資料會自動儲存在瀏覽器本地</p>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.pic-auto {
+  width: 100%;
+  height: 100%;
+  vertical-align: middle;
+  object-fit: cover;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+</style>
